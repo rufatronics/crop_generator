@@ -13,7 +13,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mistralai import Mistral
+from mistralai.client import MistralClient
+from mistralai.models.chat_completion import ChatMessage
 from huggingface_hub import HfApi
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -21,12 +22,12 @@ MISTRAL_API_KEY = os.environ["MISTRAL_API_KEY"]
 HF_TOKEN        = os.environ["HF_TOKEN"]
 HF_REPO         = "rufatronics/crop-disease-tlm-data"
 MODEL           = "mistral-small-2506"
-BATCH_SIZE      = 10       # Q&A pairs per API call
-PUSH_EVERY      = 1000     # push to HF every N examples
-MAX_PER_RUN     = 50000    # cap per GitHub Actions run (~6h window)
-TARGET_TOTAL    = 500000   # overall target across all runs
+BATCH_SIZE      = 10
+PUSH_EVERY      = 1000
+MAX_PER_RUN     = 50000
+TARGET_TOTAL    = 500000
 MAX_RETRIES     = 5
-BASE_BACKOFF    = 2        # seconds, used as BASE_BACKOFF ** attempt
+BASE_BACKOFF    = 2
 
 BUCKET_RATIOS = {
     "crop_knowledge": 0.85,
@@ -238,10 +239,10 @@ QUESTION_STYLES = [
     "practice",
     "spread",
     "what_not_to_do",
-    "comparison",           # is this worse than X
-    "local_context",        # asking in African context, specific to their situation
-    "timing",               # when to act, when to plant, when to harvest
-    "cost_effective",       # cheap solutions, what a smallholder can actually afford
+    "comparison",
+    "local_context",
+    "timing",
+    "cost_effective",
 ]
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -358,7 +359,6 @@ Return a JSON array of exactly {batch_size} objects with "instruction" and "resp
 
 # ── State management ──────────────────────────────────────────────────────────
 def load_state(api: HfApi) -> dict:
-    """Load generation state from HuggingFace or return fresh state."""
     try:
         path = api.hf_hub_download(
             repo_id=HF_REPO,
@@ -378,11 +378,11 @@ def load_state(api: HfApi) -> dict:
             "target": TARGET_TOTAL,
             "last_run": None,
             "runs_completed": 0,
+            "batch_index": 0,
         }
 
 
 def save_state(api: HfApi, state: dict):
-    """Push state.json to HuggingFace repo."""
     state["last_run"] = datetime.now(timezone.utc).isoformat()
     tmp = "/tmp/state.json"
     with open(tmp, "w") as f:
@@ -402,20 +402,18 @@ def save_state(api: HfApi, state: dict):
 
 
 # ── API call with retry ───────────────────────────────────────────────────────
-def call_mistral(client: Mistral, prompt: str, attempt: int = 0) -> list[dict] | None:
-    """Call Mistral, parse JSON response, retry on any failure with backoff."""
+def call_mistral(client: MistralClient, prompt: str, attempt: int = 0):
     try:
-        resp = client.chat.complete(
+        resp = client.chat(
             model=MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": prompt},
+                ChatMessage(role="system", content=SYSTEM_PROMPT),
+                ChatMessage(role="user",   content=prompt),
             ],
             temperature=0.92,
             max_tokens=4096,
         )
         raw = resp.choices[0].message.content.strip()
-        # Strip markdown fences if model adds them
         if raw.startswith("```"):
             lines = raw.split("\n")
             raw = "\n".join(lines[1:])
@@ -436,7 +434,7 @@ def call_mistral(client: Mistral, prompt: str, attempt: int = 0) -> list[dict] |
     except Exception as e:
         err_str = str(e)
         if "429" in err_str or "rate_limit" in err_str.lower() or "too many" in err_str.lower():
-            wait = BASE_BACKOFF ** (attempt + 4)   # aggressive backoff for rate limits
+            wait = BASE_BACKOFF ** (attempt + 4)
             log.warning(f"Rate limit — waiting {wait}s before retry")
             time.sleep(wait)
         elif any(code in err_str[:4] for code in ["500", "502", "503", "504"]):
@@ -465,44 +463,31 @@ CROP_TERMS = set(CROPS + [
 def is_quality(item: dict, bucket: str) -> bool:
     q = item["instruction"].strip()
     a = item["response"].strip()
-    # Basic length
     if len(q.split()) < 3:
         return False
     if len(a.split()) < 8:
         return False
-    # Answer must not end with a question mark
     if a.rstrip().endswith("?"):
         return False
-    # Answer must not just repeat the question
     if a.lower().strip()[:30] == q.lower().strip()[:30]:
         return False
-    # Crop knowledge must reference at least one crop/disease term
     if bucket == "crop_knowledge":
         combined = (q + " " + a).lower()
         if not any(term in combined for term in CROP_TERMS):
             return False
-    # Answer should not be a single word or empty
     if len(a.strip()) < 30:
         return False
     return True
 
 
-# ── Push to HuggingFace as JSONL ─────────────────────────────────────────────
-def push_batch_to_hf(api: HfApi, examples: list[dict], batch_index: int):
-    """
-    Append examples to HF repo as a numbered JSONL file.
-    Each push is a separate file — avoids overwrite issues entirely.
-    Files are named: data/batch_000001.jsonl, data/batch_000002.jsonl etc.
-    HF datasets library will treat all JSONL files in data/ as one dataset.
-    """
+# ── Push to HuggingFace ───────────────────────────────────────────────────────
+def push_batch_to_hf(api: HfApi, examples: list, batch_index: int):
     filename = f"data/batch_{batch_index:06d}.jsonl"
     content = "\n".join(json.dumps(ex, ensure_ascii=False) for ex in examples)
-
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl",
                                      delete=False, encoding="utf-8") as tmp:
         tmp.write(content)
         tmp_path = tmp.name
-
     api.upload_file(
         path_or_fileobj=tmp_path,
         path_in_repo=filename,
@@ -517,8 +502,6 @@ def push_batch_to_hf(api: HfApi, examples: list[dict], batch_index: int):
 
 # ── Bucket selector ───────────────────────────────────────────────────────────
 def pick_bucket(state: dict) -> str:
-    """Pick bucket with the biggest gap vs its target ratio."""
-    total = max(state["total_generated"], 1)
     deficit = {}
     for bucket, ratio in BUCKET_RATIOS.items():
         target = ratio * TARGET_TOTAL
@@ -533,17 +516,11 @@ def main():
     log.info("Crop Disease TLM — Synthetic Data Generator")
     log.info("=" * 60)
 
-    client = Mistral(api_key=MISTRAL_API_KEY)
+    client = MistralClient(api_key=MISTRAL_API_KEY)
     api    = HfApi()
 
-    # Ensure repo exists
     try:
-        api.create_repo(
-            repo_id=HF_REPO,
-            repo_type="dataset",
-            token=HF_TOKEN,
-            exist_ok=True,
-        )
+        api.create_repo(repo_id=HF_REPO, repo_type="dataset", token=HF_TOKEN, exist_ok=True)
         log.info(f"HF repo ready → https://huggingface.co/datasets/{HF_REPO}")
     except Exception as e:
         log.error(f"Cannot access HF repo: {e}")
@@ -555,29 +532,24 @@ def main():
         log.info(f"Target of {TARGET_TOTAL:,} already reached!")
         return
 
-    remaining = TARGET_TOTAL - state["total_generated"]
-    log.info(f"Remaining: {remaining:,} examples to generate")
+    log.info(f"Remaining: {TARGET_TOTAL - state['total_generated']:,} examples to generate")
 
     generated_this_run = 0
-    pending:     list[dict] = []
-    batch_index: int = state.get("batch_index", 0)
+    pending     = []
+    batch_index = state.get("batch_index", 0)
 
-    # Cycling iterators for variety
     crop_order  = CROPS * 100
     style_order = QUESTION_STYLES * 100
     random.shuffle(crop_order)
     random.shuffle(style_order)
     ci = si = 0
 
-    while (
-        generated_this_run < MAX_PER_RUN
-        and state["total_generated"] < TARGET_TOTAL
-    ):
+    while generated_this_run < MAX_PER_RUN and state["total_generated"] < TARGET_TOTAL:
         bucket = pick_bucket(state)
 
         if bucket == "crop_knowledge":
-            crop   = crop_order[ci % len(crop_order)];  ci  += 1
-            style  = style_order[si % len(style_order)]; si += 1
+            crop   = crop_order[ci % len(crop_order)];   ci  += 1
+            style  = style_order[si % len(style_order)]; si  += 1
             prompt = make_crop_prompt(crop, style, BATCH_SIZE)
         elif bucket == "greetings":
             crop   = "general"
@@ -592,7 +564,7 @@ def main():
 
         good = [p for p in pairs if is_quality(p, bucket)]
         if not good:
-            log.warning("Batch failed quality filter entirely — skipping")
+            log.warning("Batch failed quality filter — skipping")
             continue
 
         for p in good:
@@ -610,10 +582,9 @@ def main():
             f"bucket={bucket} | good={len(good)}/{BATCH_SIZE}"
         )
 
-        # Push every PUSH_EVERY examples
         if len(pending) >= PUSH_EVERY:
-            to_push   = pending[:PUSH_EVERY]
-            pending   = pending[PUSH_EVERY:]
+            to_push = pending[:PUSH_EVERY]
+            pending = pending[PUSH_EVERY:]
             batch_index += 1
             try:
                 push_batch_to_hf(api, to_push, batch_index)
@@ -621,14 +592,13 @@ def main():
                 save_state(api, state)
             except Exception as e:
                 log.error(f"Push failed (batch {batch_index}): {e} — keeping in buffer")
-                pending = to_push + pending   # put back, try again next cycle
+                pending = to_push + pending
 
-        time.sleep(0.25)   # gentle rate limit cushion
+        time.sleep(0.25)
 
-    # Final push of anything remaining
     if pending:
         batch_index += 1
-        log.info(f"Final push: {len(pending)} remaining examples → batch {batch_index:06d}")
+        log.info(f"Final push: {len(pending)} examples → batch {batch_index:06d}")
         try:
             push_batch_to_hf(api, pending, batch_index)
             state["batch_index"] = batch_index
@@ -639,7 +609,7 @@ def main():
             with open(fallback, "w", encoding="utf-8") as f:
                 for item in pending:
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
-            log.warning(f"Saved {len(pending)} examples to fallback: {fallback}")
+            log.warning(f"Saved fallback to {fallback}")
 
     state["runs_completed"] = state.get("runs_completed", 0) + 1
     save_state(api, state)
