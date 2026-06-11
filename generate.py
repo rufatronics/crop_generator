@@ -13,8 +13,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mistralai.client import MistralClient
-from mistralai.models.chat_completion import ChatMessage
+from mistralai import Mistral
 from huggingface_hub import HfApi
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -35,7 +34,6 @@ BUCKET_RATIOS = {
     "out_of_scope":   0.05,
 }
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -43,7 +41,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Knowledge base ────────────────────────────────────────────────────────────
 CROP_KNOWLEDGE = {
     "cassava": {
         "disease": "cassava_mosaic",
@@ -229,23 +226,12 @@ CROP_KNOWLEDGE = {
 CROPS = list(CROP_KNOWLEDGE.keys())
 
 QUESTION_STYLES = [
-    "worried_farmer",
-    "direct_question",
-    "symptom_description",
-    "how_to_treat",
-    "prevention",
-    "identification",
-    "urgency",
-    "practice",
-    "spread",
-    "what_not_to_do",
-    "comparison",
-    "local_context",
-    "timing",
-    "cost_effective",
+    "worried_farmer", "direct_question", "symptom_description",
+    "how_to_treat", "prevention", "identification", "urgency",
+    "practice", "spread", "what_not_to_do", "comparison",
+    "local_context", "timing", "cost_effective",
 ]
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are generating training data for an AI crop assistant called FarmBot that helps smallholder farmers in West and Central Africa.
 
 LANGUAGE STYLE — CRITICAL:
@@ -267,8 +253,6 @@ OUTPUT FORMAT:
 - Return ONLY a valid JSON array of objects, nothing else
 - Each object has exactly two keys: "instruction" and "response"
 - No markdown fences, no preamble, no explanation outside the JSON array
-- instruction: the farmer's question (varied natural phrasing)
-- response: FarmBot's answer following the length rules above
 
 SCOPE:
 - Only answer about these 10 crops: cassava, cocoa, cowpea, maize, groundnut, mango, plantain, rice, tomato
@@ -282,7 +266,7 @@ ACCURACY:
 - All advice must be applicable to smallholder African farmers with limited resources"""
 
 
-def make_crop_prompt(crop: str, style: str, batch_size: int) -> str:
+def make_crop_prompt(crop, style, batch_size):
     kb = CROP_KNOWLEDGE[crop]
     return f"""Generate {batch_size} diverse Q&A pairs about {crop.upper()} farming for African smallholder farmers.
 
@@ -301,38 +285,29 @@ Generation rules:
 - Vary phrasing heavily across all {batch_size} pairs — no two questions can sound alike
 - Mix question styles even though {style} is the main focus
 - Include at least 2 questions in pidgin or broken English style
-- Some answers can reference local practices (burning infected material, using ash, neem)
 - Answers must stay strictly within the facts above — do not add outside information
 - Every answer should end with something actionable the farmer can do today or this week
 
 Return a JSON array of exactly {batch_size} objects with "instruction" and "response" keys only."""
 
 
-def make_greetings_prompt(batch_size: int) -> str:
+def make_greetings_prompt(batch_size):
     return f"""Generate {batch_size} diverse greeting and small-talk Q&A pairs for FarmBot.
 
 FarmBot is a friendly AI crop assistant for African smallholder farmers covering: cassava, cocoa, cowpea, maize, groundnut, mango, plantain, rice, tomato.
 
-Greeting types to cover across the {batch_size} pairs:
-- Basic greetings: hello, hi, good morning, good afternoon, good evening
-- How are you / how you dey
-- Who are you / what are you
-- What can you help me with / what do you know
-- Thank you / you are helpful / God bless you
-- I need help / I have a problem with my farm
-- Pidgin versions: how body, how e dey, who you be
+Greeting types to cover: hello, hi, good morning, good afternoon, good evening, how are you, how you dey, who are you, what can you help with, thank you, I need help, how body, who you be.
 
 Rules:
 - FarmBot responds warmly and briefly (2-3 sentences max)
 - Always naturally mention 1-2 of the crops it can help with
 - African English style: "Welcome my friend!", "I dey here to help you"
-- Never give a long speech for a simple greeting
 - Vary the responses significantly — no two answers should sound the same
 
 Return a JSON array of exactly {batch_size} objects with "instruction" and "response" keys only."""
 
 
-def make_out_of_scope_prompt(batch_size: int) -> str:
+def make_out_of_scope_prompt(batch_size):
     topics = [
         "wheat", "yam", "potato", "soybean", "cotton", "sugarcane",
         "weather forecast", "fertilizer prices today", "bank loan",
@@ -344,27 +319,23 @@ def make_out_of_scope_prompt(batch_size: int) -> str:
     selected = random.sample(topics, min(8, len(topics)))
     return f"""Generate {batch_size} Q&A pairs where farmers ask FarmBot things it CANNOT help with.
 
-Topics to use (pick freely from this list): {', '.join(selected)}
+Topics to use: {', '.join(selected)}
 
-Rules for FarmBot's responses:
-- Politely explain it can only help with the 10 crops: cassava, cocoa, cowpea, maize, groundnut, mango, plantain, rice, tomato
-- Warm, not cold or rude: "Ah my friend, that one is outside what I know..."
+Rules:
+- Politely explain it can only help with: cassava, cocoa, cowpea, maize, groundnut, mango, plantain, rice, tomato
+- Warm decline: "Ah my friend, that one is outside what I know..."
 - Always end by offering to help with something it CAN do
-- Keep decline responses SHORT — 2 sentences maximum
-- Include some pidgin-style questions: "abeg how much be dollar today"
-- Vary the phrasing of both questions and declines significantly
+- Keep responses SHORT — 2 sentences max
+- Include some pidgin-style questions
 
 Return a JSON array of exactly {batch_size} objects with "instruction" and "response" keys only."""
 
 
-# ── State management ──────────────────────────────────────────────────────────
-def load_state(api: HfApi) -> dict:
+def load_state(api):
     try:
         path = api.hf_hub_download(
-            repo_id=HF_REPO,
-            filename="state.json",
-            repo_type="dataset",
-            token=HF_TOKEN,
+            repo_id=HF_REPO, filename="state.json",
+            repo_type="dataset", token=HF_TOKEN,
         )
         with open(path) as f:
             state = json.load(f)
@@ -382,18 +353,15 @@ def load_state(api: HfApi) -> dict:
         }
 
 
-def save_state(api: HfApi, state: dict):
+def save_state(api, state):
     state["last_run"] = datetime.now(timezone.utc).isoformat()
     tmp = "/tmp/state.json"
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
     try:
         api.upload_file(
-            path_or_fileobj=tmp,
-            path_in_repo="state.json",
-            repo_id=HF_REPO,
-            repo_type="dataset",
-            token=HF_TOKEN,
+            path_or_fileobj=tmp, path_in_repo="state.json",
+            repo_id=HF_REPO, repo_type="dataset", token=HF_TOKEN,
             commit_message=f"state update: {state['total_generated']:,} total examples",
         )
         log.info("State saved to HF")
@@ -401,14 +369,13 @@ def save_state(api: HfApi, state: dict):
         log.warning(f"State save failed: {e}")
 
 
-# ── API call with retry ───────────────────────────────────────────────────────
-def call_mistral(client: MistralClient, prompt: str, attempt: int = 0):
+def call_mistral(client, prompt, attempt=0):
     try:
-        resp = client.chat(
+        resp = client.chat.complete(
             model=MODEL,
             messages=[
-                ChatMessage(role="system", content=SYSTEM_PROMPT),
-                ChatMessage(role="user",   content=prompt),
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
             ],
             temperature=0.92,
             max_tokens=4096,
@@ -423,36 +390,32 @@ def call_mistral(client: MistralClient, prompt: str, attempt: int = 0):
         assert isinstance(pairs, list) and len(pairs) > 0
         for p in pairs:
             assert "instruction" in p and "response" in p
-            assert isinstance(p["instruction"], str) and len(p["instruction"].strip()) > 5
-            assert isinstance(p["response"], str) and len(p["response"].strip()) > 10
+            assert len(p["instruction"].strip()) > 5
+            assert len(p["response"].strip()) > 10
         return pairs
-
     except json.JSONDecodeError as e:
         log.warning(f"JSON parse error attempt {attempt+1}: {e}")
     except AssertionError as e:
         log.warning(f"Validation error attempt {attempt+1}: {e}")
     except Exception as e:
-        err_str = str(e)
-        if "429" in err_str or "rate_limit" in err_str.lower() or "too many" in err_str.lower():
+        err = str(e)
+        if "429" in err or "rate_limit" in err.lower() or "too many" in err.lower():
             wait = BASE_BACKOFF ** (attempt + 4)
-            log.warning(f"Rate limit — waiting {wait}s before retry")
+            log.warning(f"Rate limit — waiting {wait}s")
             time.sleep(wait)
-        elif any(code in err_str[:4] for code in ["500", "502", "503", "504"]):
+        elif any(c in err[:4] for c in ["500", "502", "503", "504"]):
             wait = BASE_BACKOFF ** (attempt + 2)
             log.warning(f"Server error — waiting {wait}s: {e}")
             time.sleep(wait)
         else:
             log.error(f"API error attempt {attempt+1}: {e}")
-
     if attempt < MAX_RETRIES - 1:
         time.sleep(BASE_BACKOFF ** (attempt + 1))
         return call_mistral(client, prompt, attempt + 1)
-
-    log.error("Max retries exceeded, skipping this batch")
+    log.error("Max retries exceeded, skipping batch")
     return None
 
 
-# ── Quality filter ────────────────────────────────────────────────────────────
 CROP_TERMS = set(CROPS + [
     "fall armyworm", "black pod", "mosaic", "blast", "blight",
     "anthracnose", "rosette", "aphid", "bunchy top", "armyworm",
@@ -460,28 +423,21 @@ CROP_TERMS = set(CROPS + [
     "harvest", "plant", "farm", "spray", "fertilizer", "yield",
 ])
 
-def is_quality(item: dict, bucket: str) -> bool:
+def is_quality(item, bucket):
     q = item["instruction"].strip()
     a = item["response"].strip()
-    if len(q.split()) < 3:
-        return False
-    if len(a.split()) < 8:
-        return False
-    if a.rstrip().endswith("?"):
-        return False
-    if a.lower().strip()[:30] == q.lower().strip()[:30]:
-        return False
+    if len(q.split()) < 3: return False
+    if len(a.split()) < 8: return False
+    if a.rstrip().endswith("?"): return False
+    if a.lower()[:30] == q.lower()[:30]: return False
+    if len(a) < 30: return False
     if bucket == "crop_knowledge":
         combined = (q + " " + a).lower()
-        if not any(term in combined for term in CROP_TERMS):
-            return False
-    if len(a.strip()) < 30:
-        return False
+        if not any(t in combined for t in CROP_TERMS): return False
     return True
 
 
-# ── Push to HuggingFace ───────────────────────────────────────────────────────
-def push_batch_to_hf(api: HfApi, examples: list, batch_index: int):
+def push_batch_to_hf(api, examples, batch_index):
     filename = f"data/batch_{batch_index:06d}.jsonl"
     content = "\n".join(json.dumps(ex, ensure_ascii=False) for ex in examples)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl",
@@ -489,34 +445,27 @@ def push_batch_to_hf(api: HfApi, examples: list, batch_index: int):
         tmp.write(content)
         tmp_path = tmp.name
     api.upload_file(
-        path_or_fileobj=tmp_path,
-        path_in_repo=filename,
-        repo_id=HF_REPO,
-        repo_type="dataset",
-        token=HF_TOKEN,
+        path_or_fileobj=tmp_path, path_in_repo=filename,
+        repo_id=HF_REPO, repo_type="dataset", token=HF_TOKEN,
         commit_message=f"add {len(examples)} examples → {filename}",
     )
     log.info(f"Pushed {len(examples)} examples → {filename}")
     Path(tmp_path).unlink(missing_ok=True)
 
 
-# ── Bucket selector ───────────────────────────────────────────────────────────
-def pick_bucket(state: dict) -> str:
+def pick_bucket(state):
     deficit = {}
     for bucket, ratio in BUCKET_RATIOS.items():
-        target = ratio * TARGET_TOTAL
-        current = state["bucket_counts"].get(bucket, 0)
-        deficit[bucket] = target - current
+        deficit[bucket] = ratio * TARGET_TOTAL - state["bucket_counts"].get(bucket, 0)
     return max(deficit, key=deficit.get)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 60)
     log.info("Crop Disease TLM — Synthetic Data Generator")
     log.info("=" * 60)
 
-    client = MistralClient(api_key=MISTRAL_API_KEY)
+    client = Mistral(api_key=MISTRAL_API_KEY)
     api    = HfApi()
 
     try:
