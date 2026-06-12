@@ -13,7 +13,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mistralai import Mistral
+import requests
 from huggingface_hub import HfApi
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -371,16 +371,25 @@ def save_state(api, state):
 
 def call_mistral(client, prompt, attempt=0):
     try:
-        resp = client.chat.complete(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": prompt},
-            ],
-            temperature=0.92,
-            max_tokens=4096,
+        r = requests.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {MISTRAL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": prompt},
+                ],
+                "temperature": 0.92,
+                "max_tokens": 4096,
+            },
+            timeout=60,
         )
-        raw = resp.choices[0].message.content.strip()
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
         if raw.startswith("```"):
             lines = raw.split("\n")
             raw = "\n".join(lines[1:])
@@ -465,7 +474,7 @@ def main():
     log.info("Crop Disease TLM — Synthetic Data Generator")
     log.info("=" * 60)
 
-    client = Mistral(api_key=MISTRAL_API_KEY)
+    client = None  # using raw requests, no SDK needed
     api    = HfApi()
 
     try:
